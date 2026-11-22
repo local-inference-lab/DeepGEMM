@@ -190,6 +190,42 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         fast_math
     )
 
+def fp8_fp4_mega_moe_tiered(y: torch.Tensor,
+                            l1_weights: Tuple[torch.Tensor, torch.Tensor],
+                            l2_weights: Tuple[torch.Tensor, torch.Tensor],
+                            sym_buffer: SymmBuffer,
+                            shared_l1_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                            shared_l2_weights: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+                            control: Optional[torch.Tensor] = None,
+                            host_rows: int = 0,
+                            hbm_slots: int = -1,
+                            recipe: Tuple[int, int, int] = (1, 1, 32),
+                            activation: str = 'swiglu',
+                            activation_clamp: Optional[float] = None,
+                            fast_math: bool = True,
+                            activation_alpha: float = 1.0,
+                            activation_beta: float = 0.0,
+                            shared_first: bool = False,
+                            num_sms: int = 0):
+    _C.fp8_fp4_mega_moe_tiered(
+        y,
+        l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
+        control,
+        sym_buffer.buffer,
+        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.num_max_tokens_per_rank,
+        sym_buffer.num_experts,
+        host_rows, hbm_slots,
+        sym_buffer.num_topk,
+        recipe,
+        activation, activation_clamp,
+        fast_math,
+        activation_alpha, activation_beta,
+        shared_first, num_sms
+    )
+
+
 def bf16_mega_moe(y: torch.Tensor,
                   l1_weights: torch.Tensor,
                   l2_weights: torch.Tensor,

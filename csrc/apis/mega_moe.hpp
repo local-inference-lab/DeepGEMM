@@ -10,6 +10,7 @@
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
+#include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe_tiered.hpp"
 #include "locality_domain.hpp"
 
 namespace deep_gemm::mega {
@@ -389,11 +390,162 @@ static void bf16_mega_moe(
         sym_buffer.zero_();
 }
 
+static void fp8_fp4_mega_moe_tiered(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1_weights_tuple_opt,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt,
+    const std::optional<torch::Tensor>& control,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
+    const int& num_max_tokens_per_rank,
+    const int& num_experts,
+    const int& host_rows,
+    const int& hbm_slots,
+    const int& num_topk,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool& fast_math,
+    const float& activation_alpha,
+    const float& activation_beta,
+    const bool& shared_first,
+    const int& num_sms_override
+) {
+    const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
+    const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
+
+    const auto num_tokens = static_cast<int>(y.size(0));
+    const auto [rm, rn, rk] = recipe;
+    DG_HOST_ASSERT(rm == 1 and rn == 1 and rk == 32);
+    DG_HOST_ASSERT(activation == "swiglu");
+    DG_HOST_ASSERT(shared_l1_weights_tuple_opt.has_value() == shared_l2_weights_tuple_opt.has_value());
+
+    const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
+    DG_HOST_ASSERT(num_ranks == 1 and rank_idx == 0);
+    DG_HOST_ASSERT(num_experts > 0 and num_topk > 0 and num_topk <= num_experts);
+
+    const int expected_hbm_rows = hbm_slots > 0 ? hbm_slots : (num_experts - host_rows);
+    if (hbm_slots > 0) {
+        DG_HOST_ASSERT(host_rows > 0 and host_rows <= num_experts);
+        DG_HOST_ASSERT(expected_hbm_rows > 0 and expected_hbm_rows <= num_experts);
+        DG_HOST_ASSERT(control.has_value());
+    } else if (host_rows > 0) {
+        DG_HOST_ASSERT(host_rows < num_experts);
+        DG_HOST_ASSERT(control.has_value());
+    } else {
+        DG_HOST_ASSERT(host_rows == 0 and expected_hbm_rows == num_experts);
+    }
+
+    const auto activation_clamp =
+        activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
+    DG_HOST_ASSERT(activation_clamp >= 0);
+    DG_HOST_ASSERT(std::isfinite(activation_alpha));
+    DG_HOST_ASSERT(std::isfinite(activation_beta));
+
+    DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
+    DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
+    const auto arch_major = jit->device.get_arch_major();
+    const auto [l1_hbm_rows, intermediate_hidden_2, hidden] =
+        check_grouped_ab_fp8_fp4(l1_weights, cute::UMMA::Major::K, arch_major);
+    const auto [l2_hbm_rows, hidden_, intermediate_hidden] =
+        check_grouped_ab_fp8_fp4(l2_weights, cute::UMMA::Major::K, arch_major);
+    const auto weight_dtype = l1_weights.scalar_type();
+    DG_HOST_ASSERT(weight_dtype == torch::kFloat8_e4m3fn or weight_dtype == kPackedFP4);
+    DG_HOST_ASSERT(l2_weights.scalar_type() == weight_dtype);
+    DG_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+    DG_HOST_ASSERT(l1_hbm_rows == expected_hbm_rows and l2_hbm_rows == expected_hbm_rows);
+    DG_HOST_ASSERT(hidden == hidden_);
+    DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
+    DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
+
+    constexpr int kGranMN = 1, kGranK = 32;
+    check_sf_layout(l1_weights_sf, intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                    expected_hbm_rows, true, false, torch::kInt);
+    check_sf_layout(l2_weights_sf, hidden, intermediate_hidden, kGranMN, kGranK,
+                    expected_hbm_rows, true, false, torch::kInt);
+
+    int num_shared_experts = 0, shared_intermediate_hidden = 0;
+    torch::Tensor shared_l1_weights, shared_l1_weights_sf, shared_l2_weights, shared_l2_weights_sf;
+    if (shared_l1_weights_tuple_opt.has_value()) {
+        std::tie(shared_l1_weights, shared_l1_weights_sf) = shared_l1_weights_tuple_opt.value();
+        std::tie(shared_l2_weights, shared_l2_weights_sf) = shared_l2_weights_tuple_opt.value();
+        shared_intermediate_hidden = static_cast<int>(shared_l2_weights.size(1));
+        num_shared_experts = shared_intermediate_hidden / intermediate_hidden;
+
+        DG_HOST_ASSERT(shared_intermediate_hidden % intermediate_hidden == 0);
+        DG_HOST_ASSERT(shared_l1_weights.dim() == 2 and shared_l2_weights.dim() == 2);
+        DG_HOST_ASSERT(shared_l1_weights.size(0) == shared_intermediate_hidden * 2);
+        DG_HOST_ASSERT(shared_l1_weights.size(1) == hidden);
+        DG_HOST_ASSERT(shared_l2_weights.size(0) == hidden);
+        DG_HOST_ASSERT(shared_l1_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(shared_l2_weights.scalar_type() == torch::kFloat8_e4m3fn);
+        DG_HOST_ASSERT(shared_l1_weights.is_contiguous() and shared_l2_weights.is_contiguous());
+        DG_HOST_ASSERT(get_major_type_ab(shared_l1_weights) == cute::UMMA::Major::K);
+        DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
+        check_sf_layout(shared_l1_weights_sf, shared_intermediate_hidden * 2, hidden, kGranMN, kGranK,
+                        std::nullopt, true, false, torch::kInt);
+        check_sf_layout(shared_l2_weights_sf, hidden, shared_intermediate_hidden, kGranMN, kGranK,
+                        std::nullopt, true, false, torch::kInt);
+    }
+
+    if (control.has_value()) {
+        DG_HOST_ASSERT(control->scalar_type() == torch::kInt);
+        DG_HOST_ASSERT(control->numel() == 16 + num_experts);
+        DG_HOST_ASSERT(control->is_contiguous());
+        DG_HOST_ASSERT(control->device() == y.device());
+    }
+
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
+        num_ranks, num_experts,
+        num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden,
+        weight_dtype == torch::kFloat8_e4m3fn ? "fp8xfp8" : "fp8xfp4",
+        activation, num_shared_experts
+    );
+    DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+
+    const auto [x, x_sf, topk_idx, topk_weights,
+                shared_l1_acts, shared_l1_acts_sf, shared_l2_acts, shared_l2_acts_sf,
+                l1_acts, l1_acts_sf, l2_acts, l2_acts_sf] = slice(sym_buffer);
+
+    if (arch_major == 10) {
+        sm100_fp8_fp4_mega_moe_tiered(
+            y,
+            l1_acts, l1_acts_sf,
+            l2_acts, l2_acts_sf,
+            shared_l1_acts, shared_l1_acts_sf,
+            shared_l2_acts, shared_l2_acts_sf,
+            l1_weights, l2_weights,
+            l1_weights_sf, l2_weights_sf,
+            shared_l1_weights, shared_l2_weights,
+            shared_l1_weights_sf, shared_l2_weights_sf,
+            control,
+            sym_buffer_ptrs,
+            rank_idx, num_max_tokens_per_rank,
+            num_experts,
+            num_shared_experts,
+            num_tokens, num_topk,
+            hidden, intermediate_hidden,
+            activation_clamp, activation_alpha, activation_beta,
+            fast_math,
+            shared_first,
+            num_sms_override);
+    } else {
+        DG_HOST_UNREACHABLE("Unsupported architecture");
+    }
+
+    if (deep_jit::get_env<int>("DG_COMM_KERNEL_DEBUG"))
+        sym_buffer.zero_();
+}
+
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
     m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
+    m.def("fp8_fp4_mega_moe_tiered", &fp8_fp4_mega_moe_tiered);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 }
 
